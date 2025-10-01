@@ -40,6 +40,7 @@ class CrawlerControllerTest {
                 .success(true)
                 .timestamp(LocalDateTime.now())
                 .message("Crawled successfully")
+                .data(null)
                 .build();
 
         when(crawlerService.crawl(anyString())).thenReturn(response);
