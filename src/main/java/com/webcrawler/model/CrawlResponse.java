@@ -33,4 +33,7 @@ public class CrawlResponse {
 
     @Schema(description = "Parsed crawler result in unified schema format")
     private JsonNode data;
+
+    @Schema(description = "Content classification including category and language")
+    private ContentClassification classification;
 }

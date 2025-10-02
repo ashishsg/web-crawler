@@ -7,7 +7,6 @@ import com.webcrawler.config.JsoupConfig;
 import com.webcrawler.model.CrawlResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.text.StringEscapeUtils;
 import org.jsoup.Connection;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
@@ -26,41 +25,84 @@ public class JsoupCrawlerWrapperImpl implements JsoupCrawlerWrapper {
 
     private final JsoupConfig jsoupConfig;
     private final ObjectMapper objectMapper;
+    private final TextClassificationService textClassificationService;
+    private final JavaScriptRenderer javaScriptRenderer;
 
     @Override
     public CrawlResponse crawl(String url) {
         log.info("Starting crawl for URL: {}", url);
 
         try {
-            // Execute HTTP request and parse HTML
-            // Add headers to mimic real browser and avoid 403 Forbidden errors
-            Connection.Response response = Jsoup.connect(url)
-                    .userAgent(jsoupConfig.getUserAgent())
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                    .header("Accept-Language", "en-US,en;q=0.9")
-                    .header("Accept-Encoding", "gzip, deflate, br")
-                    .header("Upgrade-Insecure-Requests", "1")
-                    .referrer("https://www.google.com/")
-                    .timeout(jsoupConfig.getTimeout())
-                    .followRedirects(jsoupConfig.isFollowRedirects())
-                    .maxBodySize(jsoupConfig.getMaxBodySize())
-                    .ignoreContentType(true)
-                    .execute();
+            Document document;
+            int statusCode = 200;
+            boolean usedJavaScriptRenderer = false;
 
-            Document document = response.parse();
+            // Try regular Jsoup first
+            try {
+                // Execute HTTP request and parse HTML
+                // Add headers to mimic real browser and avoid 403 Forbidden errors
+                // Note: Jsoup handles gzip decompression automatically, don't set Accept-Encoding manually
+                Connection.Response response = Jsoup.connect(url)
+                        .userAgent(jsoupConfig.getUserAgent())
+                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                        .header("Accept-Language", "en-US,en;q=0.9")
+                        .header("Upgrade-Insecure-Requests", "1")
+                        .referrer("https://www.google.com/")
+                        .timeout(jsoupConfig.getTimeout())
+                        .followRedirects(jsoupConfig.isFollowRedirects())
+                        .maxBodySize(jsoupConfig.getMaxBodySize())
+                        .ignoreContentType(true)
+                        .execute();
+
+                statusCode = response.statusCode();
+                document = response.parse();
+
+                // Check if page has minimal content (likely JavaScript-rendered)
+                String bodyText = document.body() != null ? document.body().text() : "";
+                if (bodyText.trim().isEmpty() && javaScriptRenderer.isAvailable()) {
+                    log.info("Page appears to be JavaScript-rendered, using headless browser");
+                    String renderedHtml = javaScriptRenderer.renderPage(url);
+                    document = Jsoup.parse(renderedHtml);
+                    usedJavaScriptRenderer = true;
+                }
+
+            } catch (IOException e) {
+                // If regular crawling fails and JS renderer is available, try with it
+                if (javaScriptRenderer.isAvailable()) {
+                    log.info("Regular crawling failed, trying with JavaScript renderer");
+                    String renderedHtml = javaScriptRenderer.renderPage(url);
+                    document = Jsoup.parse(renderedHtml);
+                    usedJavaScriptRenderer = true;
+                } else {
+                    throw e;
+                }
+            }
+
+            if (usedJavaScriptRenderer) {
+                log.info("Successfully rendered page with JavaScript");
+            }
 
             // Extract basic data and create JSON structure
             JsonNode data = extractBasicData(document);
 
-            log.info("Successfully crawled URL: {} with status code: {}", url, response.statusCode());
+            // Extract text for classification
+            String title = document.title();
+            String description = getMetaContent(document, "description");
+            String textContent = document.body() != null ? document.body().text() : "";
+
+            // Classify the content
+            var classification = textClassificationService.classify(title, description, textContent);
+
+            log.info("Successfully crawled URL: {} with status code: {}", url, statusCode);
 
             return CrawlResponse.builder()
                     .url(url)
-                    .statusCode(response.statusCode())
+                    .statusCode(statusCode)
                     .success(true)
                     .timestamp(LocalDateTime.now())
-                    .message("Successfully crawled URL")
+                    .message(usedJavaScriptRenderer ? "Successfully crawled URL with JavaScript rendering" : "Successfully crawled URL")
                     .data(data)
+                    .classification(classification)
                     .build();
 
         } catch (IOException e) {
@@ -84,11 +126,16 @@ public class JsoupCrawlerWrapperImpl implements JsoupCrawlerWrapper {
         ObjectNode dataNode = objectMapper.createObjectNode();
 
         // Basic extraction - to be replaced with unified schema
-        // Use StringEscapeUtils to sanitize text and prevent JSON control character issues
-        dataNode.put("title", sanitizeText(document.title()));
-        dataNode.put("description", sanitizeText(getMetaContent(document, "description")));
-        dataNode.put("textContent", sanitizeText(document.body() != null ? document.body().text() : ""));
+        // Jackson handles JSON escaping automatically, no need for manual sanitization
+        dataNode.put("title", document.title());
+        dataNode.put("description", getMetaContent(document, "description"));
+        dataNode.put("textContent", document.body() != null ? document.body().text() : "");
         dataNode.put("htmlLength", document.html().length());
+
+        // Extract H1 tags
+        var h1Tags = objectMapper.createArrayNode();
+        document.select("h1").forEach(h1 -> h1Tags.add(h1.text()));
+        dataNode.set("h1Tags", h1Tags);
 
         return dataNode;
     }
@@ -99,17 +146,5 @@ public class JsoupCrawlerWrapperImpl implements JsoupCrawlerWrapper {
     private String getMetaContent(Document document, String attribute) {
         var element = document.select("meta[name=" + attribute + "]").first();
         return element != null ? element.attr("content") : "";
-    }
-
-    /**
-     * Sanitizes text using Apache Commons Text to escape JSON control characters
-     * Prevents JSON parsing errors caused by unescaped control characters
-     */
-    private String sanitizeText(String text) {
-        if (text == null || text.isEmpty()) {
-            return "";
-        }
-        // Unescape first (in case already escaped), then re-escape properly for JSON
-        return StringEscapeUtils.escapeJson(text);
     }
 }
